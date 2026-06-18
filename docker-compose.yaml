@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+  # RSSHub - 用于微信公众号文章采集
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: rsshub
+    ports:
+      - "1200:1200"
+    environment:
+      - CACHE_TYPE=memory
+      - CACHE_EXPIRE=300
+      - ACCESS_CONTROL=allow_list
+      - ALLOWLIST=localhost,127.0.0.1
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:1200/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 新闻聚合推送器
+  news-aggregator:
+    build: .
+    container_name: news-aggregator
+    depends_on:
+      rsshub:
+        condition: service_healthy
+    environment:
+      - RSSHUB_URL=http://rsshub:1200
+      - FEISHU_APP_ID=${FEISHU_APP_ID:-}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
+      - EMAIL_USER=${EMAIL_USER:-}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD:-}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./output:/app/output
+    restart: on-failure
+    # 手动执行模式：不常驻，由cron触发
+    # 如需常驻可改为: command: ["--config", "/app/config.yaml"]
+
+  # 定时任务调度器
+  scheduler:
+    image: alpine:latest
+    container_name: news-scheduler
+    depends_on:
+      - news-aggregator
+    environment:
+      - CRON_SCHEDULE=0 9 * * *    # 每天北京时间9:00（UTC 1:00）
+    command: >
+      sh -c '
+        echo "$${CRON_SCHEDULE} wget -q -O- http://news-aggregator:8000/run || true" > /etc/crontabs/root
+        crond -f -l 2
+      '
+    restart: always

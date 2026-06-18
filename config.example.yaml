@@ -1,0 +1,62 @@
+# ========== 1. 信息源（只填网址或名称）==========
+# 新闻网站：直接粘贴网址，系统自动识别并抓取
+# 微信公众号：填写 "公众号:公众号名称"
+# RSS网站：系统会自动发现RSS链接
+
+sources:
+  - "https://finance.sina.com.cn"
+  - "https://www.nhsa.gov.cn"
+  - "https://36kr.com"
+  - "公众号:中国保险报"
+  - "公众号:保观"
+
+# ========== 2. 筛选条件 ==========
+filter:
+  industry: "保险"                    # 所属行业（用于分类标签）
+  keywords:                          # 关注关键词（任一命中即保留）
+    - "保险"
+    - "医保"
+    - "健康险"
+    - "监管"
+    - "新规"
+    - "政策"
+    - "创新"
+    - "AI"
+    - "数字化"
+  exclude:                           # 排除关键词（命中任一则丢弃）
+    - "娱乐"
+    - "八卦"
+    - "明星"
+    - "广告"
+  top_n: 10                          # 每次推送条数
+  hours: 168                         # 时间范围（小时），168=近7天
+
+# ========== 3. 推送渠道 ==========
+push:
+  feishu:
+    enabled: true
+    # 凭证通过环境变量注入：FEISHU_APP_ID, FEISHU_APP_SECRET
+    doc_folder: "your_folder_token"  # 飞书文档存放文件夹token
+    notify_chat: "your_chat_id"      # 推送通知的群聊ID
+
+  email:
+    enabled: false
+    # 凭证通过环境变量注入：EMAIL_USER, EMAIL_PASSWORD
+    smtp_host: "smtp.exmail.qq.com"
+    smtp_port: 465
+    to:
+      - "team@example.com"
+
+  local:
+    enabled: true
+    path: "./output"
+    format: "markdown"               # markdown | html | json
+
+# ========== 4. RSSHub配置（用于微信公众号采集）==========
+rsshub_url: "http://localhost:1200"  # 自建RSSHub地址
+
+# ========== 5. 内容生成 ==========
+content:
+  summary_mode: "extract"            # extract（提取摘要）| llm（AI生成）
+  summary_max_length: 300            # 摘要最大字数
+  insight_enabled: false             # 是否生成深度洞察（需配置LLM）
