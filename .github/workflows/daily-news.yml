@@ -1,0 +1,43 @@
+# GitHub Actions 定时执行
+# 每天 UTC 1:00（北京时间 9:00）自动执行新闻收集推送
+
+name: Daily News Collection
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # UTC 1:00 = 北京时间 9:00
+  workflow_dispatch:       # 支持手动触发
+
+jobs:
+  collect-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Run news aggregator
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          RSSHUB_URL: ${{ secrets.RSSHUB_URL || 'http://localhost:1200' }}
+        run: python -m src.main --config config.yaml --verbose
+
+      - name: Upload output artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-output-${{ github.run_id }}
+          path: ./output/
+          retention-days: 30
