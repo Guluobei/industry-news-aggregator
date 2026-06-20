@@ -63,7 +63,7 @@ class SourceDetector:
             # 可能是公众号名称
             if len(source) <= 30:
                 return COLLECTOR_WECHAT
-            raise FatalIssue(
+            raise ErrorIssue(
                 code="SOURCE_INVALID_FORMAT",
                 source=source,
                 reason=f"无法识别「{source}」的格式",
@@ -87,21 +87,21 @@ class SourceDetector:
                 resp = client.head(url, headers=headers)
                 content_type = resp.headers.get("content-type", "").lower()
         except httpx.ConnectError:
-            raise FatalIssue(
+            raise ErrorIssue(
                 code="SOURCE_UNREACHABLE",
                 source=url,
                 reason=f"网址「{url}」无法访问，连接被拒绝",
                 suggestion="请检查地址是否正确，或该网站是否已关闭。可在浏览器中打开确认",
             )
         except httpx.TimeoutException:
-            raise FatalIssue(
+            raise ErrorIssue(
                 code="SOURCE_TIMEOUT",
                 source=url,
                 reason=f"网址「{url}」响应超时（15秒内无响应）",
                 suggestion="该网站可能访问缓慢或存在网络限制，可稍后重试",
             )
         except httpx.HTTPError as e:
-            raise FatalIssue(
+            raise ErrorIssue(
                 code="SOURCE_HTTP_ERROR",
                 source=url,
                 reason=f"网址「{url}」请求失败：{type(e).__name__}",
@@ -111,7 +111,7 @@ class SourceDetector:
 
         # 检查状态码
         if resp.status_code == 404:
-            raise FatalIssue(
+            raise ErrorIssue(
                 code="SOURCE_NOT_FOUND",
                 source=url,
                 reason=f"网址「{url}」页面不存在（HTTP 404）",
