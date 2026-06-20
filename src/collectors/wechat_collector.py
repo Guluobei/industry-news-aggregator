@@ -84,8 +84,9 @@ class WeWeRSSBackend(WechatBackend):
         """通过 RSS 接口拉取文章列表
 
         feed_id 格式: MP_WXS_xxxxx
+        API 路径: /feeds/{feed_id}.rss
         """
-        url = f"{self.base_url}/{feed_id}.rss"
+        url = f"{self.base_url}/feeds/{feed_id}.rss"
         resp = fetch_url(url, timeout=20)
         feed = feedparser.parse(resp.text)
 

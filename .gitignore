@@ -1,12 +1,8 @@
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
+# Output
 output/
-*.log
+test_output/
+*.pyc
+__pycache__/
 .env
-config.yaml
 .venv/
-venv/
+industry_news_aggregator.egg-info/
