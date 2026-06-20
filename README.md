@@ -470,6 +470,108 @@ class MyPusher(BasePusher):
 
 ---
 
+## Git 推送的安全配置
+
+**警告**：永远不要在 URL 里明文带 token。`https://<token>@github.com/...` 这样的 URL 会让 token 进入 shell 历史、git config、屏幕回显，存在泄露风险。
+
+### 推荐：使用 Git 凭据助手
+
+凭据存储有 3 种方式，从轻到重：
+
+| 助手 | 存储位置 | 有效期 | 安全性 | 适用场景 |
+|------|---------|--------|--------|---------|
+| `cache` | 内存 | 超时自动清除（默认 900 秒）| ⭐⭐⭐⭐⭐ | 临时会话 |
+| `store` | `~/.git-credentials`（明文）| 永久 | ⭐⭐ | 极少使用 |
+| `manager` | 系统 keychain（加密）| 永久 | ⭐⭐⭐⭐⭐ | 长期使用 |
+
+### 方案 A：内存 cache（最安全，适合沙箱/临时）
+
+```bash
+# 配置：token 只在内存中保留 1 小时
+git config --global credential.helper 'cache --timeout=3600'
+
+# 第一次 push 时"喂"入 token（不会进入 shell 历史）
+printf "protocol=https\nhost=github.com\nusername=<your_username>\npassword=<your_token>\n" | git credential approve
+
+# 之后所有 push/pull 都不再需要明文 token
+git push origin main
+```
+
+清理：
+```bash
+git credential-cache exit   # 立即清除内存中的 token
+```
+
+### 方案 B：系统 keychain（推荐用于个人电脑）
+
+**macOS**：
+```bash
+git config --global credential.helper osxkeychain
+# 第一次 push 时输入 token，会被存入 Keychain
+```
+
+**Windows**：
+```bash
+git config --global credential.helper manager
+# 第一次 push 时输入 token，会被存入 Windows 凭据管理器
+```
+
+**Linux**（需安装）：
+```bash
+sudo apt install libsecret-1-0 libsecret-1-dev
+sudo apt install gnome-keyring
+git config --global credential.helper /usr/share/doc/git/contrib/credential/libsecret/git-credential-libsecret
+```
+
+### 方案 C：环境变量（CI/CD 场景）
+
+```bash
+# ~/.bashrc 或 CI 配置中
+export GITHUB_TOKEN=ghp_xxx
+export GIT_ASKPASS=/bin/echo
+export GIT_ASKPASS_PASSWORD=$GITHUB_TOKEN
+# 不写入 shell 历史
+echo 'export GITHUB_TOKEN=ghp_xxx' >> ~/.bashrc
+chmod 600 ~/.bashrc
+```
+
+### 验证是否安全
+
+```bash
+# 检查远程 URL 是否还有 token
+git remote -v
+# ✅ 应输出：https://github.com/<user>/<repo>.git
+# ❌ 不应包含：ghp_xxx 或 @
+
+# 检查 git config 中没有明文 token
+grep -r "ghp_" ~/.gitconfig
+# ✅ 应无输出
+```
+
+### 如果 token 已经泄露
+
+1. 立刻到 GitHub > Settings > Developer settings > Personal access tokens 撤销
+2. 重新生成 token
+3. 重复上面"方案 A/B/C"中的步骤
+4. 检查本地所有脚本、配置文件、shell 历史中是否还有 token 残留
+5. 考虑使用 SSH 密钥（更安全的方案）
+
+### 进阶：使用 SSH 密钥（最安全）
+
+```bash
+# 1. 生成密钥
+ssh-keygen -t ed25519 -C "your_email@example.com"
+# 2. 复制公钥
+cat ~/.ssh/id_ed25519.pub
+# 3. 粘贴到 GitHub > Settings > SSH and GPG keys
+# 4. 改用 SSH URL
+git remote set-url origin git@github.com:<user>/<repo>.git
+# 5. 之后所有操作都不需要 token
+git push origin main
+```
+
+---
+
 ## License
 
 MIT
