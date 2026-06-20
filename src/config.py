@@ -107,13 +107,54 @@ class ContentConfig(BaseModel):
     llm_model: str = "gpt-4o-mini"
 
 
+class WechatAccountConfig(BaseModel):
+    """单个公众号订阅配置"""
+    name: str
+    backend: str = "wewe-rss"  # wewe-rss | rsshub
+    feed_id: str = ""          # 留空则尝试自动发现
+
+
+class WechatBackendsConfig(BaseModel):
+    """微信公众号采集后端配置"""
+    wewe_rss: dict = Field(default_factory=lambda: {"enabled": True, "url": "http://localhost:4000"})
+    rsshub: dict = Field(default_factory=lambda: {"enabled": True, "url": "http://localhost:1200"})
+
+    class Config:
+        # 允许任意键以兼容未来扩展
+        extra = "allow"
+
+
+class WechatConfig(BaseModel):
+    """微信公众号采集配置"""
+    enabled: bool = False
+    default_backend: str = "wewe-rss"
+    backends: WechatBackendsConfig = Field(default_factory=WechatBackendsConfig)
+    accounts: list[WechatAccountConfig] = Field(default_factory=list)
+
+    def to_legacy_dict(self) -> dict:
+        """转换为旧版 collector 配置格式（保持向后兼容）"""
+        return {
+            "wechat": {
+                "wewe-rss": {
+                    "enabled": self.backends.wewe_rss.get("enabled", True),
+                    "url": self.backends.wewe_rss.get("url", "http://localhost:4000"),
+                },
+                "rsshub": {
+                    "enabled": self.backends.rsshub.get("enabled", True),
+                    "url": self.backends.rsshub.get("url", "http://localhost:1200"),
+                },
+            }
+        }
+
+
 class AppConfig(BaseModel):
     """应用总配置"""
     sources: list[str] = Field(default_factory=list)
     filter: FilterConfig = Field(default_factory=FilterConfig)
     push: PushConfig = Field(default_factory=PushConfig)
-    rsshub_url: str = "http://localhost:1200"
+    rsshub_url: str = "http://localhost:1200"  # 保留以兼容旧配置
     content: ContentConfig = Field(default_factory=ContentConfig)
+    wechat_accounts: WechatConfig = Field(default_factory=WechatConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "AppConfig":

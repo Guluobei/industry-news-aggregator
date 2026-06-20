@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 class BaseCollector(abc.ABC):
     """所有收集器的统一接口"""
 
+    def __init__(self, config: dict | None = None):
+        """初始化收集器
+
+        Args:
+            config: 收集器特定的配置字典（可选）
+        """
+        self.config = config or {}
+
     @abc.abstractmethod
     def collect(self, source: str, issue_tracker: "IssueTracker", **kwargs) -> list[NewsItem]:
         """
@@ -45,12 +53,17 @@ class CollectorRegistry:
         logger.debug(f"注册收集器: {source_type} -> {collector_class.__name__}")
 
     @classmethod
-    def get(cls, source_type: str) -> BaseCollector | None:
-        """获取收集器实例"""
+    def get(cls, source_type: str, config: dict | None = None) -> BaseCollector | None:
+        """获取收集器实例
+
+        Args:
+            source_type: 收集器类型
+            config: 传递给收集器的配置
+        """
         collector_class = cls._registry.get(source_type)
         if collector_class is None:
             return None
-        return collector_class()
+        return collector_class(config=config)
 
     @classmethod
     def get_registered_types(cls) -> list[str]:

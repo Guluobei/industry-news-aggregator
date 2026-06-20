@@ -95,7 +95,19 @@ def run(config_path: str, dry_run: bool = False, verbose: bool = False) -> Execu
     success_count = 0
     failed_count = 0
 
-    for source in config.sources:
+    # 扩展 sources：将 wechat_accounts 转成 "公众号:..." 形式
+    extended_sources = list(config.sources)
+    if config.wechat_accounts.enabled:
+        for acc in config.wechat_accounts.accounts:
+            source = f"公众号:{acc.name}"
+            if acc.backend:
+                source += f":backend={acc.backend}"
+            if acc.feed_id:
+                source += f":feed_id={acc.feed_id}"
+            extended_sources.append(source)
+        logger.info(f"从 wechat_accounts 追加 {len(config.wechat_accounts.accounts)} 个公众号源")
+
+    for source in extended_sources:
         source_name = source[:50] + "..." if len(source) > 50 else source
         logger.info(f"正在处理信息源：{source_name}")
 
@@ -105,7 +117,12 @@ def run(config_path: str, dry_run: bool = False, verbose: bool = False) -> Execu
             logger.info(f"  → 识别为 {collector_type} 类型")
 
             # 获取收集器
-            collector = CollectorRegistry.get(collector_type)
+            if collector_type == "wechat":
+                wechat_config_dict = config.wechat_accounts.to_legacy_dict()
+            else:
+                wechat_config_dict = None
+
+            collector = CollectorRegistry.get(collector_type, config=wechat_config_dict)
             if collector is None:
                 raise ErrorIssue(
                     code="COLLECTOR_NOT_FOUND",
@@ -116,8 +133,6 @@ def run(config_path: str, dry_run: bool = False, verbose: bool = False) -> Execu
 
             # 执行收集
             kwargs = {"source_name": source_name}
-            if collector_type == "wechat":
-                kwargs["rsshub_url"] = config.rsshub_url
 
             items = collector.collect(source, issue_tracker, **kwargs)
             all_items.extend(items)

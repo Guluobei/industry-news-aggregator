@@ -185,21 +185,61 @@ $env:FEISHU_APP_SECRET="xxxxxxxxxxxxxxxxxxxxxxxx"
 
 ---
 
-### Step 7：部署RSSHub（如需公众号采集）
+### Step 7：部署公众号采集服务（可选）
 
-如果配置了微信公众号源，需要部署RSSHub：
+> **重要说明（2026-06 更新）**
+> 微信公众号官方不提供公开 RSS 接口，所有采集方案都是"灰色路径"：
+> - 依赖第三方维护者持续逆向微信协议
+> - 一旦微信升级风控，方案可能突然失效
+> - 涉及账号安全，建议使用专用小号
+>
+> 如果你**没有强烈的公众号需求**，建议只用 RSS 和主流新闻网站作主信息源——它们稳定且零风险。
+
+#### 后端方案对比
+
+| 后端 | 稳定性 | 覆盖 | 风险 | 推荐度 |
+|------|-------|------|------|-------|
+| **wewe-rss**（微信读书） | 中 | 中 | 低 | ⭐⭐⭐⭐⭐ |
+| **rsshub**（自部署） | 高 | 高 | 中 | ⭐⭐⭐ |
+| **搜狗** | 低 | 低 | 低 | ⭐ |
+
+#### 方案 A：wewe-rss（推荐）
+
+1. 部署 wewe-rss（Docker 一行）：
+   ```bash
+   docker run -d --name wewe-rss -p 4000:4000 \
+     -e DATABASE_TYPE=sqlite \
+     -e AUTH_CODE=123567 \
+     -v $(pwd)/wewe-data:/app/data \
+     cooderl/wewe-rss-sqlite:latest
+   ```
+
+2. 浏览器打开 http://localhost:4000 ，扫码登录微信读书（**建议用专用小号**）
+
+3. 在 Web UI 添加公众号订阅（提交公众号文章链接），记录返回的 `feed_id`（格式如 `MP_WXS_1234567890`）
+
+4. 修改 `config.yaml`：
+   ```yaml
+   wechat_accounts:
+     enabled: true
+     accounts:
+       - name: "中国保险报"
+         backend: "wewe-rss"
+         feed_id: "MP_WXS_1234567890"  # 填入上一步获得的 ID
+   ```
+
+#### 方案 B：RSSHub（高覆盖，自部署）
 
 ```bash
-# 一键启动（需安装Docker）
 docker run -d --name rsshub -p 1200:1200 diygod/rsshub
-
-# 验证
-curl http://localhost:1200/
 ```
 
-配置文件中确认RSSHub地址：
+#### 方案 C：不部署
+
+如果暂时不需要公众号，可在 `config.yaml` 设置：
 ```yaml
-rsshub_url: "http://localhost:1200"
+wechat_accounts:
+  enabled: false
 ```
 
 ---
@@ -332,10 +372,17 @@ pip install -e . --upgrade
 | 格式 | 说明 | 示例 |
 |------|------|------|
 | 普通网址 | 系统自动识别为网页/RSS | `https://finance.sina.com.cn` |
-| 公众号 | 前缀"公众号:"+名称 | `公众号:中国保险报` |
 | RSS地址 | 含 `/feed` 或 `/rss` 的URL | `https://36kr.com/feed` |
+| 公众号（简单） | 前缀"公众号:"+名称 | `公众号:中国保险报` |
+| 公众号（指定后端） | 加 `:backend=xxx` | `公众号:中国保险报:backend=wewe-rss` |
+| 公众号（指定 feed_id） | 加 `:feed_id=xxx` | `公众号:中国保险报:backend=wewe-rss:feed_id=MP_WXS_123` |
 
 系统会自动探测网址类型，用户无需关心技术细节。
+
+**公众号源的工作流程：**
+1. 系统按 `wewe-rss` → `rsshub` → `搜狗` 顺序尝试后端
+2. 第一个返回结果的胜出，后续不再尝试
+3. 任何后端失败都不影响其他源（已在 v1.0 验证）
 
 ---
 

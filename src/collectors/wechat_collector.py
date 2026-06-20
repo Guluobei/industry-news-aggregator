@@ -1,4 +1,10 @@
-"""行业新闻聚合推送器 - 微信公众号收集器"""
+"""行业新闻聚合推送器 - 微信公众号收集器（多后端适配器）
+
+核心原则：
+- 微信公众号是"灰色"采集路径，所有方案都有失效风险
+- 默认推荐微信读书方案（wewe-rss），相对最稳定
+- 支持多后端配置，用户可按需选择
+"""
 
 from __future__ import annotations
 
@@ -22,162 +28,110 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class WeChatCollector(BaseCollector):
-    """微信公众号收集器
+class WechatBackend:
+    """微信采集后端抽象基类"""
 
-    采集策略（按优先级自动降级）：
-    1. 用户已知公众号ID（KNOWN_ACCOUNTS或自定义）→ 走RSSHub
-    2. 未知公众号ID → 通过RSSHub搜索接口查找
-    3. RSSHub不可用时 → 通过搜狗微信搜索降级
+    def __init__(self, name: str, base_url: str, **options):
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self.options = options
+
+    def health_check(self) -> bool:
+        """检查后端服务是否可用"""
+        raise NotImplementedError
+
+    def list_articles(self, feed_id: str, limit: int = 30) -> list[dict]:
+        """列出指定 feed 的最近文章
+
+        Returns:
+            list of dict: 每个 dict 至少包含 title, url, publish_time
+        """
+        raise NotImplementedError
+
+    def find_feed_id(self, account_name: str) -> str | None:
+        """通过公众号名称查找 feed_id"""
+        raise NotImplementedError
+
+
+class WeWeRSSBackend(WechatBackend):
+    """微信读书后端（推荐方案）
+
+    优点：
+    - 不需要扫码授权你的微信
+    - API 相对稳定（更新频率比 RSSHub 慢但更可靠）
+    - 维护活跃（cooderl/wewe-rss，2024-12 最新 v2.6.1）
+
+    缺点：
+    - 部分小众公众号不在微信读书内
+    - 走 weread.111965.xyz 中转（有隐私风险，但作者声明不保存数据）
+    - 长期看仍依赖腾讯 API 策略
+
+    部署：参考 https://github.com/cooderl/wewe-rss
     """
 
-    # 已知公众号名称 → 微信ID映射（可手动维护扩展）
-    # 微信ID即公众号URL中的微信号，如 https://mp.weixin.qq.com/s/xxx 中的 __biz 参数
-    KNOWN_ACCOUNTS: dict[str, str] = {
-        "中国保险报": "zgbxb_2012",
-        "保观": "Insurance-Review",
-        "银保监微课堂": "cbirc_wechat",
-        "慧保天下": "hbtxgb",
-        "券商中国": "quanshangcn",
-        "21世纪经济报道": "jjbd21",
-        "财新网": "caixinwang",
-        "澎湃新闻": "thepapernews",
-    }
+    def health_check(self) -> bool:
+        try:
+            resp = httpx.get(f"{self.base_url}/", timeout=10)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
-    # 搜狗微信搜索（RSSHub不可用时的降级方案）
-    SOGOU_SEARCH_URL = "https://weixin.sogou.com/weixin"
-    SOGOU_ARTICLE_URL = "https://weixin.sogou.com"
+    def find_feed_id(self, account_name: str) -> str | None:
+        """wewe-rss 没有自动发现接口，需要用户先在 Web UI 添加订阅并获取 feed_id"""
+        return None
 
-    def collect(self, source: str, issue_tracker: IssueTracker, **kwargs) -> list[NewsItem]:
+    def list_articles(self, feed_id: str, limit: int = 30) -> list[dict]:
+        """通过 RSS 接口拉取文章列表
+
+        feed_id 格式: MP_WXS_xxxxx
         """
-        从微信公众号收集新闻
+        url = f"{self.base_url}/{feed_id}.rss"
+        resp = fetch_url(url, timeout=20)
+        feed = feedparser.parse(resp.text)
 
-        Args:
-            source: "公众号:名称" 格式或公众号名称
-            issue_tracker: 问题追踪器
-        """
-        rsshub_url = kwargs.get("rsshub_url", "http://localhost:1200")
+        items = []
+        for entry in feed.entries[:limit]:
+            publish_time = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                from datetime import datetime, timezone
 
-        # 解析公众号名称
-        account_name = self._parse_account_name(source)
-        source_name = f"公众号:{account_name}"
+                publish_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            elif hasattr(entry, "published"):
+                publish_time = parse_date(entry.published)
 
-        # Step 1: 检查RSSHub是否可用（不再作为致命错误，降级为提示）
-        rsshub_available = self._check_rsshub(rsshub_url, issue_tracker)
-
-        # Step 2: 获取微信ID
-        wechat_id = self.KNOWN_ACCOUNTS.get(account_name)
-
-        if not wechat_id and rsshub_available:
-            wechat_id = self._search_account_id_via_rsshub(account_name, rsshub_url)
-
-        if not wechat_id:
-            # 降级：通过搜狗搜索查找公众号
-            wechat_id = self._search_account_id_via_sogou(account_name, issue_tracker)
-
-        if not wechat_id:
-            raise ErrorIssue(
-                code="WECHAT_NOT_FOUND",
-                source=source_name,
-                reason=f"未找到公众号「{account_name}」，可能名称有误或该公众号未被收录",
-                suggestion="请确认公众号名称是否正确，或在配置中手动添加微信ID（KNOWN_ACCOUNTS字典）",
-            )
-
-        # Step 3: 通过RSSHub或搜狗获取文章
-        if rsshub_available:
-            try:
-                items = self._collect_via_rsshub(rsshub_url, wechat_id, source_name, account_name, issue_tracker)
-            except ErrorIssue as e:
-                if "404" in e.issue.reason or "NOT_FOUND" in e.issue.code:
-                    # RSSHub获取失败，降级到搜狗
-                    logger.warning(f"RSSHub获取失败，降级到搜狗搜索: {account_name}")
-                    items = self._collect_via_sogou(account_name, source_name, issue_tracker)
-                else:
-                    raise
-        else:
-            # RSSHub不可用，直接走搜狗
-            items = self._collect_via_sogou(account_name, source_name, issue_tracker)
-
-        # Step 4: 检查是否长期无更新
-        if items:
-            from datetime import datetime, timezone
-
-            latest = items[0]
-            if latest.publish_time:
-                now = datetime.now(timezone.utc)
-                if latest.publish_time.tzinfo is None:
-                    latest.publish_time = latest.publish_time.replace(tzinfo=timezone.utc)
-                days_since = (now - latest.publish_time).days
-                if days_since > 30:
-                    issue_tracker.record(WarnIssue(
-                        code="WECHAT_STALE",
-                        source=source_name,
-                        reason=f"公众号「{account_name}」已超过{days_since}天未更新，最近一篇文章发布于{latest.publish_time.strftime('%Y-%m-%d')}",
-                        suggestion="如确认该公众号已停更，建议从配置中移除",
-                    ).issue)
-
-        if not items:
-            # 区分不同原因
-            if not rsshub_available:
-                # RSSHub不可用 + 搜狗也搜不到
-                raise WarnIssue(
-                    code="WECHAT_NEED_RSSHUB",
-                    source=source_name,
-                    reason=f"公众号「{account_name}」采集需要RSSHub支持",
-                    suggestion="请部署自建RSSHub（推荐）或使用支持公众号的第三方RSS服务。当前无RSSHub时无法采集公众号内容",
-                )
-            raise WarnIssue(
-                code="WECHAT_EMPTY",
-                source=source_name,
-                reason=f"公众号「{account_name}」在指定时间范围内没有发布新文章",
-                suggestion="正常现象，下次执行时将自动检查",
-            )
-
-        logger.info(f"公众号「{account_name}」收集到 {len(items)} 篇文章")
+            items.append({
+                "title": entry.get("title", ""),
+                "url": entry.get("link", ""),
+                "publish_time": publish_time,
+                "summary": entry.get("summary", ""),
+                "author": entry.get("author", ""),
+            })
         return items
 
-    def _parse_account_name(self, source: str) -> str:
-        """从源标识中解析公众号名称"""
-        if source.startswith("公众号:") or source.startswith("公众号："):
-            return source.split(":", 1)[-1].split("：", 1)[-1].strip()
-        return source.strip()
 
-    def _check_rsshub(self, rsshub_url: str, issue_tracker: IssueTracker) -> bool:
-        """检查RSSHub服务是否可用（不抛致命错误，返回bool）"""
+class RSSHubBackend(WechatBackend):
+    """RSSHub 后端
+
+    优点：
+    - 覆盖率高（可搜索/发现公众号）
+    - 维护活跃（RSSHub 组织）
+
+    缺点：
+    - 公开实例屏蔽微信路由
+    - 需自部署，配置相对复杂
+    - 微信路径需启用对应路由（部分需登录态）
+    """
+
+    def health_check(self) -> bool:
         try:
-            resp = httpx.get(f"{rsshub_url.rstrip('/')}/", timeout=10)
-            if resp.status_code == 200:
-                return True
-            issue_tracker.record(WarnIssue(
-                code="RSSHUB_DOWN",
-                source="RSSHub服务",
-                reason=f"RSSHub服务异常（HTTP {resp.status_code}）",
-                suggestion="公众号采集将自动降级到搜狗微信搜索。如需启用RSSHub，请检查服务状态",
-            ).issue)
-            return False
-        except httpx.ConnectError:
-            issue_tracker.record(WarnIssue(
-                code="RSSHUB_UNREACHABLE",
-                source="RSSHub服务",
-                reason="无法连接RSSHub服务",
-                suggestion="公众号采集将自动降级到搜狗微信搜索。如需启用RSSHub，请先启动服务",
-            ).issue)
-            return False
-        except httpx.TimeoutException:
-            issue_tracker.record(WarnIssue(
-                code="RSSHUB_TIMEOUT",
-                source="RSSHub服务",
-                reason="RSSHub服务响应超时",
-                suggestion="公众号采集将自动降级到搜狗微信搜索",
-            ).issue)
-            return False
-        except Exception as e:
-            logger.debug(f"RSSHub健康检查异常: {e}")
+            resp = httpx.get(f"{self.base_url}/", timeout=10)
+            return resp.status_code == 200
+        except Exception:
             return False
 
-    def _search_account_id_via_rsshub(self, name: str, rsshub_url: str) -> str | None:
-        """通过RSSHub搜索接口查找公众号ID"""
-        search_url = f"{rsshub_url.rstrip('/')}/wechat/mp/search/{name}"
+    def find_feed_id(self, account_name: str) -> str | None:
+        """通过 /wechat/mp/search/{name} 搜索公众号ID"""
+        search_url = f"{self.base_url}/wechat/mp/search/{account_name}"
         try:
             resp = fetch_url(search_url, timeout=15)
             feed = feedparser.parse(resp.text)
@@ -192,175 +146,282 @@ class WeChatCollector(BaseCollector):
             logger.debug(f"RSSHub搜索公众号ID失败: {e}")
             return None
 
-    def _collect_via_rsshub(
-        self,
-        rsshub_url: str,
-        wechat_id: str,
-        source_name: str,
-        account_name: str,
-        issue_tracker: IssueTracker,
-    ) -> list[NewsItem]:
-        """通过RSSHub获取公众号文章"""
-        rss_url = f"{rsshub_url.rstrip('/')}/wechat/mp/{wechat_id}"
-        return RSSCollector().collect(rss_url, issue_tracker, source_name=source_name)
+    def list_articles(self, feed_id: str, limit: int = 30) -> list[dict]:
+        """通过 /wechat/mp/{id} 拉取文章"""
+        rss_url = f"{self.base_url}/wechat/mp/{feed_id}"
+        resp = fetch_url(rss_url, timeout=20)
+        feed = feedparser.parse(resp.text)
 
-    def _search_account_id_via_sogou(
-        self,
-        name: str,
-        issue_tracker: IssueTracker,
-    ) -> str | None:
-        """通过搜狗微信搜索查找公众号ID
+        items = []
+        for entry in feed.entries[:limit]:
+            publish_time = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                from datetime import datetime, timezone
 
-        Returns:
-            公众号的__biz参数（用作唯一标识）
-        """
+                publish_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            elif hasattr(entry, "published"):
+                publish_time = parse_date(entry.published)
+
+            items.append({
+                "title": entry.get("title", ""),
+                "url": entry.get("link", ""),
+                "publish_time": publish_time,
+                "summary": entry.get("summary", ""),
+                "author": entry.get("author", ""),
+            })
+        return items
+
+
+class SogouBackend(WechatBackend):
+    """搜狗微信搜索后端（最后降级方案）
+
+    优点：无需部署任何服务
+    缺点：JS 渲染导致解析困难，仅作为占位降级，不保证能拿到内容
+    """
+
+    SOGOU_SEARCH_URL = "https://weixin.sogou.com/weixin"
+
+    def health_check(self) -> bool:
+        """搜狗永远"可用"（不抛异常即视为可用）"""
+        return True
+
+    def find_feed_id(self, account_name: str) -> str | None:
         try:
-            params = {"type": "1", "query": name}
+            params = {"type": "1", "query": account_name}
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://weixin.sogou.com/",
             }
             resp = httpx.get(self.SOGOU_SEARCH_URL, params=params, headers=headers, timeout=15, follow_redirects=True)
             resp.raise_for_status()
-
-            # 解析搜狗搜索结果，提取公众号__biz
-            # 搜狗返回的HTML中包含目标公众号的链接
-            html = resp.text
-            # 查找 __biz 参数
-            matches = re.findall(r'__biz=([A-Za-z0-9%+/=]+)', html)
-            if matches:
-                return matches[0]
-            return None
+            matches = re.findall(r"__biz=([A-Za-z0-9%+/=]+)", resp.text)
+            return matches[0] if matches else None
         except Exception as e:
             logger.debug(f"搜狗搜索公众号ID失败: {e}")
             return None
 
-    def _collect_via_sogou(
+    def list_articles(self, feed_id: str, limit: int = 30) -> list[dict]:
+        """搜狗的反爬导致难以解析，仅作为占位"""
+        raise NotImplementedError("搜狗路径反爬严重，不提供文章列表接口")
+
+
+# 后端注册表
+BACKEND_REGISTRY: dict[str, type[WechatBackend]] = {
+    "wewe-rss": WeWeRSSBackend,
+    "rsshub": RSSHubBackend,
+    "sogou": SogouBackend,
+}
+
+
+class WeChatCollector(BaseCollector):
+    """微信公众号收集器（多后端适配器）
+
+    支持后端（按推荐顺序）：
+    1. wewe-rss（微信读书） - 默认推荐，平衡稳定性和安全性
+    2. rsshub（自部署）    - 覆盖率最高，需自部署
+    3. sogou（搜狗）       - 兜底方案，效果有限
+
+    公众号 feed_id 格式：
+    - wewe-rss: "MP_WXS_xxxxx"（用户在 Web UI 添加订阅后获得）
+    - rsshub: "__biz=xxxxx"（系统自动搜索）
+    - sogou: "__biz=xxxxx"（系统自动搜索）
+
+    配置示例：
+    ```yaml
+    wechat_accounts:
+      - name: "中国保险报"
+        backend: "wewe-rss"
+        feed_id: "MP_WXS_3083075681"  # 在 wewe-rss Web UI 添加后获得
+      - name: "保观"
+        backend: "rsshub"
+        # 无需 feed_id，系统自动搜索
+    ```
+    """
+
+    def __init__(self, config: dict | None = None):
+        super().__init__(config)
+        self.backends: dict[str, WechatBackend] = {}
+        self._init_backends()
+
+    def _init_backends(self):
+        """根据配置初始化后端实例"""
+        wechat_config = (self.config or {}).get("wechat", {})
+
+        # 默认后端配置
+        defaults = {
+            "wewe-rss": {"url": "http://localhost:4000", "enabled": True},
+            "rsshub": {"url": "http://localhost:1200", "enabled": True},
+        }
+
+        for backend_name, backend_cls in BACKEND_REGISTRY.items():
+            backend_conf = wechat_config.get(backend_name, {})
+            cfg = {**defaults.get(backend_name, {}), **backend_conf}
+            if cfg.get("enabled", True):
+                self.backends[backend_name] = backend_cls(
+                    name=backend_name,
+                    base_url=cfg.get("url", defaults.get(backend_name, {}).get("url", "")),
+                )
+
+    def collect(self, source: str, issue_tracker: IssueTracker, **kwargs) -> list[NewsItem]:
+        """
+        从微信公众号收集新闻
+
+        Args:
+            source: "公众号:名称[:backend=xxx:feed_id=xxx]" 格式
+            issue_tracker: 问题追踪器
+        """
+        # 解析 source 中的元数据
+        meta = self._parse_source(source)
+        account_name = meta["name"]
+        specified_backend = meta.get("backend")
+        specified_feed_id = meta.get("feed_id")
+        source_name = f"公众号:{account_name}"
+
+        # 决定后端优先级
+        backend_order = self._resolve_backend_order(specified_backend)
+        if specified_feed_id:
+            # 用户已指定 feed_id，直接走对应后端
+            backend = self.backends.get(specified_backend or "wewe-rss")
+            if not backend:
+                raise ErrorIssue(
+                    code="WECHAT_BACKEND_UNAVAILABLE",
+                    source=source_name,
+                    reason=f"指定的后端「{specified_backend}」未启用或未配置",
+                    suggestion="检查 config 中 wechat.{specified_backend} 配置",
+                )
+            return self._collect_from_backend(backend, specified_feed_id, account_name, source_name, issue_tracker)
+
+        # 多后端降级流程
+        last_error = None
+        for backend_name in backend_order:
+            if backend_name not in self.backends:
+                continue
+            backend = self.backends[backend_name]
+
+            if not backend.health_check():
+                issue_tracker.record(WarnIssue(
+                    code=f"WECHAT_BACKEND_DOWN_{backend_name.upper().replace('-', '_')}",
+                    source=f"微信后端:{backend_name}",
+                    reason=f"后端「{backend_name}」不可用，跳过",
+                    suggestion="如需启用此后端，请先部署对应服务",
+                ).issue)
+                continue
+
+            # 尝试查找 feed_id
+            feed_id = backend.find_feed_id(account_name)
+            if not feed_id:
+                continue
+
+            try:
+                return self._collect_from_backend(backend, feed_id, account_name, source_name, issue_tracker)
+            except ErrorIssue as e:
+                last_error = e
+                issue_tracker.record(WarnIssue(
+                    code=f"WECHAT_BACKEND_FAILED_{backend_name.upper().replace('-', '_')}",
+                    source=source_name,
+                    reason=f"后端「{backend_name}」采集失败：{e.issue.reason}",
+                    suggestion="尝试下一个后端",
+                ).issue)
+                continue
+
+        # 全部后端失败
+        if last_error:
+            raise ErrorIssue(
+                code="WECHAT_ALL_BACKENDS_FAILED",
+                source=source_name,
+                reason=f"所有微信采集后端均失败，最后错误：{last_error.issue.reason}",
+                suggestion="请在 wewe-rss Web UI 手动添加公众号订阅，并填入 feed_id",
+            )
+        raise ErrorIssue(
+            code="WECHAT_NOT_FOUND",
+            source=source_name,
+            reason=f"未找到公众号「{account_name}」的 feed_id",
+            suggestion=(
+                "请在 wewe-rss Web UI 手动添加公众号订阅（推荐），"
+                "或在 source 中指定 backend 和 feed_id"
+            ),
+        )
+
+    def _collect_from_backend(
         self,
+        backend: WechatBackend,
+        feed_id: str,
         account_name: str,
         source_name: str,
         issue_tracker: IssueTracker,
     ) -> list[NewsItem]:
-        """通过搜狗微信搜索获取公众号文章列表"""
-        items: list[NewsItem] = []
-
+        """从指定后端采集文章"""
         try:
-            # Step 1: 搜索公众号主页
-            params = {"type": "1", "query": account_name}
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": "https://weixin.sogou.com/",
-            }
-            resp = httpx.get(self.SOGOU_SEARCH_URL, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-
-            # Step 2: 从搜索结果中提取公众号最新文章列表
-            soup = BeautifulSoup(resp.text, "lxml")
-
-            # 搜狗搜索结果中，文章列表位于 .news-list 或 .s-p-top 类的容器
-            article_blocks = soup.select("li[class*='news']") or soup.select(".s-p") or soup.select("li")
-
-            for block in article_blocks[:15]:  # 最多15条
-                try:
-                    # 提取标题
-                    title_elem = block.select_one("a") or block.select_one("h3") or block.select_one(".tit")
-                    if not title_elem:
-                        continue
-                    title = title_elem.get_text(strip=True)
-                    if not title or len(title) < 5:
-                        continue
-
-                    # 提取链接
-                    href = ""
-                    for a in block.select("a[href]"):
-                        href = a.get("href", "")
-                        if href and "javascript:" not in href:
-                            break
-                    if not href:
-                        continue
-
-                    # 搜狗返回的是中间页URL，需要拼接
-                    if href.startswith("/"):
-                        full_url = self.SOGOU_ARTICLE_URL + href
-                    elif href.startswith("http"):
-                        full_url = href
-                    else:
-                        continue
-
-                    # 提取摘要
-                    summary_elem = block.select_one(".txt-info, .txt, p")
-                    summary = summary_elem.get_text(strip=True) if summary_elem else ""
-
-                    # 提取时间（搜狗通常显示 "1天前"、"刚刚" 等）
-                    time_elem = block.select_one(".s-p, .time, .date, em")
-                    time_text = time_elem.get_text(strip=True) if time_elem else ""
-                    publish_time = self._parse_sogou_time(time_text)
-
-                    items.append(NewsItem(
-                        title=title,
-                        url=full_url,
-                        source=f"公众号:{account_name}",
-                        content=summary,
-                        summary=summary[:300] if summary else "",
-                        publish_time=publish_time,
-                    ))
-                except Exception as e:
-                    logger.debug(f"解析搜狗文章块失败: {e}")
-                    continue
-
-            if not items:
-                logger.warning(f"搜狗搜索未找到「{account_name}」的文章，搜狗可能加强了反爬")
-
-        except httpx.HTTPStatusError as e:
-            raise ErrorIssue(
-                code="WECHAT_SOGOU_BLOCKED",
-                source=source_name,
-                reason=f"搜狗微信搜索返回HTTP {e.response.status_code}，可能触发了反爬",
-                suggestion="建议部署自建RSSHub以获得稳定的公众号采集能力",
-            )
+            raw_items = backend.list_articles(feed_id, limit=30)
         except Exception as e:
             raise ErrorIssue(
-                code="WECHAT_SOGOU_FAILED",
+                code="WECHAT_FETCH_FAILED",
                 source=source_name,
-                reason=f"通过搜狗采集公众号失败：{type(e).__name__}",
-                suggestion="建议部署自建RSSHub以获得稳定的公众号采集能力",
+                reason=f"通过「{backend.name}」拉取文章失败：{type(e).__name__}",
                 detail=str(e),
+                suggestion="检查后端服务状态或网络连接",
             )
 
+        items = []
+        for raw in raw_items:
+            if not raw.get("title") or not raw.get("url"):
+                continue
+            items.append(NewsItem(
+                title=raw["title"],
+                url=raw["url"],
+                source=source_name,
+                summary=raw.get("summary", "")[:300] if raw.get("summary") else "",
+                content=raw.get("summary", ""),
+                publish_time=raw.get("publish_time"),
+                author=raw.get("author", ""),
+            ))
+
+        if not items:
+            raise WarnIssue(
+                code="WECHAT_EMPTY",
+                source=source_name,
+                reason=f"公众号「{account_name}」在指定时间范围内没有新文章",
+                suggestion="正常现象，下次执行时将自动检查",
+            )
+
+        logger.info(f"公众号「{account_name}」通过「{backend.name}」收集到 {len(items)} 篇文章")
         return items
 
-    def _parse_sogou_time(self, time_text: str) -> object:
-        """解析搜狗时间格式（如"2小时前"、"昨天"、"3天前"）"""
-        from datetime import datetime, timedelta, timezone
+    def _resolve_backend_order(self, specified: str | None) -> list[str]:
+        """解析后端优先级
 
-        if not time_text:
-            return None
+        Args:
+            specified: 用户在 source 中指定的后端名称
 
-        now = datetime.now(timezone.utc)
+        Returns:
+            后端名称列表（按尝试顺序）
+        """
+        # 默认顺序：wewe-rss > rsshub > sogou
+        default_order = ["wewe-rss", "rsshub", "sogou"]
+        if specified:
+            # 把指定后端提到最前
+            return [specified] + [b for b in default_order if b != specified]
+        return [b for b in default_order if b in self.backends]
 
-        # 处理相对时间
-        if "刚刚" in time_text:
-            return now
-        if "分钟前" in time_text:
-            match = re.search(r"(\d+)\s*分钟前", time_text)
-            if match:
-                return now - timedelta(minutes=int(match.group(1)))
-        if "小时前" in time_text:
-            match = re.search(r"(\d+)\s*小时前", time_text)
-            if match:
-                return now - timedelta(hours=int(match.group(1)))
-        if "昨天" in time_text:
-            return now - timedelta(days=1)
-        if "天前" in time_text:
-            match = re.search(r"(\d+)\s*天前", time_text)
-            if match:
-                return now - timedelta(days=int(match.group(1)))
-        if "周前" in time_text:
-            match = re.search(r"(\d+)\s*周前", time_text)
-            if match:
-                return now - timedelta(weeks=int(match.group(1)))
+    def _parse_source(self, source: str) -> dict:
+        """解析 source 字符串
 
-        # 尝试标准日期解析
-        return parse_date(time_text)
+        支持格式：
+        - "公众号:中国保险报"
+        - "公众号:中国保险报:backend=wewe-rss"
+        - "公众号:中国保险报:backend=wewe-rss:feed_id=MP_WXS_123"
+        - "公众号:中国保险报:feed_id=MP_WXS_123"
+        """
+        if source.startswith("公众号:") or source.startswith("公众号："):
+            content = source.split(":", 1)[-1].split("：", 1)[-1].strip()
+        else:
+            content = source.strip()
+
+        parts = content.split(":")
+        result = {"name": parts[0].strip()}
+
+        for part in parts[1:]:
+            if "=" in part:
+                k, v = part.split("=", 1)
+                result[k.strip()] = v.strip()
+        return result
